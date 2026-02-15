@@ -12,6 +12,7 @@ react {
     // reactNativeDir = file("../../node_modules/react-native")
     // codegenDir = file("../../node_modules/@react-native/codegen")
     // cliFile = file("../../node_modules/react-native/cli.js")
+   
 
     /* Variants */
     // debuggableVariants = ["liteDebug", "liteDebugOptimized", "prodDebug", "prodDebugOptimized"]
@@ -27,6 +28,8 @@ react {
     /* Hermes Commands */
     // hermesCommand = "$rootDir/my-custom-hermesc/bin/hermesc"
     // hermesFlags = ["-O", "-output-source-map"]
+
+    //  hermesCommand = "../../node_modules/react-native/sdks/hermesc/win64-bin/hermesc.exe"
 
     /* Autolinking */
     autolinkLibrariesWithApp()
