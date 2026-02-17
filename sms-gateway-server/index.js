@@ -11,7 +11,7 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 
 // --- 🌍 CONFIGURATION ---
-const PORT = process.env.PORT;
+const PORT = process.env.PORT || 3000;
 const MONGO_URI = process.env.MONGO_URI;
 const JWT_SECRET = process.env.JWT_SECRET;
 const FRONTEND_URL = process.env.FRONTEND_URL;
@@ -28,7 +28,7 @@ app.use(helmet());
 
 const corsOptions = {
     origin: FRONTEND_URL, 
-    methods: ["GET", "POST", "DELETE"], // 'DELETE' zaroori hai admin ke liye
+    methods: ["GET", "POST", "DELETE"], 
     credentials: true 
 };
 
@@ -58,6 +58,7 @@ mongoose.connect(MONGO_URI)
     .then(() => console.log("✅ MongoDB Connected"))
     .catch(err => console.error("❌ MongoDB Error:", err));
 
+// 1. USER SCHEMA
 const UserSchema = new mongoose.Schema({
     name: { type: String, required: true },
     email: { type: String, required: true, unique: true },
@@ -68,6 +69,19 @@ const UserSchema = new mongoose.Schema({
 });
 
 const User = mongoose.model('User', UserSchema);
+
+// 2. MESSAGE SCHEMA (🆕 NEW ADDITION)
+const MessageSchema = new mongoose.Schema({
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    phone: { type: String, required: true },
+    content: { type: String, required: true },
+    status: { type: String, enum: ['Pending', 'Sent', 'Failed'], default: 'Pending' },
+    errorMessage: { type: String }, // Agar fail hua toh reason
+    createdAt: { type: Date, default: Date.now }
+});
+
+const Message = mongoose.model('Message', MessageSchema);
+
 const deviceSocketMap = new Map(); 
 
 // --- 🏠 BASIC ROUTE ---
@@ -183,6 +197,26 @@ app.delete('/admin/user/:id', async (req, res) => {
     }
 });
 
+// --- 📜 GET MESSAGE HISTORY (🆕 NEW ROUTE) ---
+app.get('/user/messages', async (req, res) => {
+    try {
+        const { apiKey } = req.query; // API Key query params mein bhejo
+        if (!apiKey) return res.status(400).json({ success: false, message: "API Key required" });
+
+        const user = await User.findOne({ apiKey });
+        if (!user) return res.status(401).json({ success: false, message: "Invalid API Key" });
+
+        // Last 50 messages fetch karo
+        const messages = await Message.find({ userId: user._id })
+            .sort({ createdAt: -1 }) // Newest first
+            .limit(50);
+
+        res.json({ success: true, messages });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // --- 🔌 SOCKET CONNECTION LOGIC ---
 io.on('connection', async (socket) => {
     const { deviceId } = socket.handshake.auth;
@@ -207,7 +241,7 @@ io.on('connection', async (socket) => {
     });
 });
 
-// --- 🚀 SEND SMS API ---
+// --- 🚀 SEND SMS API (UPDATED WITH LOGS) ---
 app.post('/send-sms', async (req, res) => {
     try {
         const { apiKey, phone, msg } = req.body;
@@ -215,25 +249,58 @@ app.post('/send-sms', async (req, res) => {
         if(!apiKey || !phone || !msg) 
             return res.status(400).json({ success: false, message: "Missing parameters" });
         
+        // 1. User Validate
         const user = await User.findOne({ apiKey });
         if (!user) return res.status(401).json({ success: false, message: "Invalid API Key" });
 
-        const socketId = deviceSocketMap.get(user.deviceId);
-        if (!socketId) return res.status(404).json({ success: false, message: "Device Offline" });
+        // 2. Message ko Database mein save karo (Status: Pending)
+        const newMessage = new Message({
+            userId: user._id,
+            phone,
+            content: msg,
+            status: 'Pending'
+        });
+        await newMessage.save();
 
+        // 3. Device Check
+        const socketId = deviceSocketMap.get(user.deviceId);
+        if (!socketId) {
+            // Agar device offline hai, toh DB update karo aur error return karo
+            newMessage.status = 'Failed';
+            newMessage.errorMessage = 'Device Offline';
+            await newMessage.save();
+            return res.status(404).json({ success: false, message: "Device Offline", messageId: newMessage._id });
+        }
+
+        // 4. Timeout Logic
         let responseSent = false;
-        const timeout = setTimeout(() => {
+        const timeout = setTimeout(async () => {
             if(!responseSent) {
                 responseSent = true;
-                res.status(408).json({success: false, message: "Device Timeout"});
+                // Timeout ho gaya, DB update karo
+                newMessage.status = 'Failed';
+                newMessage.errorMessage = 'Device Timeout (No response from app)';
+                await newMessage.save();
+                res.status(408).json({success: false, message: "Device Timeout", messageId: newMessage._id});
             }
         }, 15000);
 
-        io.to(socketId).emit('send_sms_command', { phone, msg }, (response) => {
+        // 5. Socket Event Send
+        io.to(socketId).emit('send_sms_command', { phone, msg, id: newMessage._id }, async (response) => {
             if(!responseSent) {
                 clearTimeout(timeout);
                 responseSent = true;
-                res.json(response); 
+                
+                // 6. Mobile App se Response aane par DB update
+                if(response.success) {
+                    newMessage.status = 'Sent';
+                } else {
+                    newMessage.status = 'Failed';
+                    newMessage.errorMessage = response.error || "App reported failure";
+                }
+                await newMessage.save();
+
+                res.json({ ...response, messageId: newMessage._id }); 
             }
         });
 
