@@ -307,17 +307,24 @@ app.post('/send-sms', async (req, res) => {
         // 4. Timeout Logic
         const timeout = setTimeout(() => {
             handleCompletion('Failed', 'Device Timeout (No response from app)');
-        }, 15000);
+        }, 30000);
 
         // 5. Socket Event Send
-        io.to(socketId).emit('send_sms_command', { phone, msg, id: newMessage._id }, (response) => {
+        const targetSocket = io.sockets.sockets.get(socketId);
+        
+        if (targetSocket) {
+            targetSocket.emit('send_sms_command', { phone, msg, id: newMessage._id }, (response) => {
+                clearTimeout(timeout);
+                if (response && response.success) {
+                    handleCompletion('Sent', null);
+                } else {
+                    handleCompletion('Failed', response ? response.error : "App reported failure");
+                }
+            });
+        } else {
             clearTimeout(timeout);
-            if (response && response.success) {
-                handleCompletion('Sent', null);
-            } else {
-                handleCompletion('Failed', response ? response.error : "App reported failure");
-            }
-        });
+            handleCompletion('Failed', 'Device Disconnected before sending');
+        }
 
     } catch (err) {
         console.error("SMS API Error:", err);
