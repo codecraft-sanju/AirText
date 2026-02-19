@@ -77,6 +77,7 @@ const MessageSchema = new mongoose.Schema({
     content: { type: String, required: true },
     status: { type: String, enum: ['Pending', 'Sent', 'Failed'], default: 'Pending' },
     errorMessage: { type: String }, // Agar fail hua toh reason
+    webhookUrl: { type: String },
     createdAt: { type: Date, default: Date.now }
 });
 
@@ -244,7 +245,7 @@ io.on('connection', async (socket) => {
 // --- 🚀 SEND SMS API (UPDATED WITH LOGS) ---
 app.post('/send-sms', async (req, res) => {
     try {
-        const { apiKey, phone, msg } = req.body;
+        const { apiKey, phone, msg, webhookUrl } = req.body;
 
         if(!apiKey || !phone || !msg) 
             return res.status(400).json({ success: false, message: "Missing parameters" });
@@ -258,7 +259,8 @@ app.post('/send-sms', async (req, res) => {
             userId: user._id,
             phone,
             content: msg,
-            status: 'Pending'
+            status: 'Pending',
+            webhookUrl: webhookUrl || null
         });
         await newMessage.save();
 
@@ -272,41 +274,56 @@ app.post('/send-sms', async (req, res) => {
             return res.status(404).json({ success: false, message: "Device Offline", messageId: newMessage._id });
         }
 
-        // 4. Timeout Logic
-        let responseSent = false;
-        const timeout = setTimeout(async () => {
-            if(!responseSent) {
-                responseSent = true;
-                // Timeout ho gaya, DB update karo
-                newMessage.status = 'Failed';
-                newMessage.errorMessage = 'Device Timeout (No response from app)';
-                await newMessage.save();
-                res.status(408).json({success: false, message: "Device Timeout", messageId: newMessage._id});
+        res.status(202).json({ success: true, message: "Message Queued", messageId: newMessage._id });
+
+        let responseHandled = false;
+
+        const handleCompletion = async (status, errorMessage) => {
+            if (responseHandled) return;
+            responseHandled = true;
+
+            newMessage.status = status;
+            if (errorMessage) newMessage.errorMessage = errorMessage;
+            await newMessage.save();
+
+            if (newMessage.webhookUrl) {
+                try {
+                    await fetch(newMessage.webhookUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            messageId: newMessage._id,
+                            phone: newMessage.phone,
+                            status: newMessage.status,
+                            errorMessage: newMessage.errorMessage
+                        })
+                    });
+                } catch (webhookError) {
+                    console.error("Webhook Error:", webhookError.message);
+                }
             }
+        };
+
+        // 4. Timeout Logic
+        const timeout = setTimeout(() => {
+            handleCompletion('Failed', 'Device Timeout (No response from app)');
         }, 15000);
 
         // 5. Socket Event Send
-        io.to(socketId).emit('send_sms_command', { phone, msg, id: newMessage._id }, async (response) => {
-            if(!responseSent) {
-                clearTimeout(timeout);
-                responseSent = true;
-                
-                // 6. Mobile App se Response aane par DB update
-                if(response.success) {
-                    newMessage.status = 'Sent';
-                } else {
-                    newMessage.status = 'Failed';
-                    newMessage.errorMessage = response.error || "App reported failure";
-                }
-                await newMessage.save();
-
-                res.json({ ...response, messageId: newMessage._id }); 
+        io.to(socketId).emit('send_sms_command', { phone, msg, id: newMessage._id }, (response) => {
+            clearTimeout(timeout);
+            if (response && response.success) {
+                handleCompletion('Sent', null);
+            } else {
+                handleCompletion('Failed', response ? response.error : "App reported failure");
             }
         });
 
     } catch (err) {
         console.error("SMS API Error:", err);
-        res.status(500).json({ error: err.message });
+        if (!res.headersSent) {
+            res.status(500).json({ error: err.message });
+        }
     }
 });
 
