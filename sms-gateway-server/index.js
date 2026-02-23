@@ -254,6 +254,8 @@ app.get('/whatsapp/start', async (req, res) => {
             return res.json({ success: true, message: "Client exists", status: user.waStatus, qr: user.waQr });
         }
 
+        console.log(`[WA DEBUG] ⏳ Starting initialization for user: ${user.email}`);
+
         const client = new Client({
             authStrategy: new LocalAuth({ clientId: userIdStr }),
             puppeteer: { 
@@ -265,41 +267,54 @@ app.get('/whatsapp/start', async (req, res) => {
                     '--no-first-run',
                     '--no-zygote',
                     '--single-process',
-                    '--disable-gpu'
+                    '--disable-gpu',
+                    // --- 🔥 CORE FIX: Faking a real Windows Chrome Browser ---
+                    '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
                 ] 
             },
-            webVersionCache: {
-                type: 'remote',
-                remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html'
-            }
+            // Note: webVersionCache is explicitly removed so WhatsApp fetches the latest supported stable web bundle natively.
         });
 
         waClients.set(userIdStr, client);
 
+        client.on('loading_screen', (percent, message) => {
+            console.log(`[WA DEBUG] 🔄 Loading WhatsApp Web: ${percent}% - ${message}`);
+        });
+
         client.on('qr', async (qr) => {
+            console.log(`[WA DEBUG] 🟩 QR Code Generated for ${user.email}`);
             try {
                 const qrDataURL = await qrcode.toDataURL(qr);
                 await User.findByIdAndUpdate(user._id, { waQr: qrDataURL, waStatus: 'QR_Ready' });
             } catch (error) {
-                console.error("QR Generation Error:", error);
+                console.error("[WA DEBUG] ❌ QR Generation Error:", error);
             }
         });
 
         client.on('ready', async () => {
-            console.log(`WhatsApp Ready for User: ${user.email}`);
+            console.log(`[WA DEBUG] ✅ WhatsApp Ready for User: ${user.email}`);
             await User.findByIdAndUpdate(user._id, { waQr: null, waStatus: 'Connected' });
         });
 
-        client.on('disconnected', async () => {
-            console.log(`WhatsApp Disconnected for User: ${user.email}`);
+        client.on('authenticated', () => {
+            console.log(`[WA DEBUG] 🔐 WhatsApp Authenticated for User: ${user.email}`);
+        });
+
+        client.on('auth_failure', msg => {
+            console.error(`[WA DEBUG] ❌ WhatsApp Auth Failure for ${user.email}:`, msg);
+        });
+
+        client.on('disconnected', async (reason) => {
+            console.log(`[WA DEBUG] 🔌 WhatsApp Disconnected for User: ${user.email} | Reason: ${reason}`);
             await User.findByIdAndUpdate(user._id, { waQr: null, waStatus: 'Disconnected' });
             waClients.delete(userIdStr);
         });
 
-        client.initialize().catch(err => console.error("WA Init Error:", err));
+        client.initialize().catch(err => console.error("[WA DEBUG] 🚨 WA Init Error:", err));
 
         res.json({ success: true, message: "WhatsApp initialization started" });
     } catch (err) {
+        console.error("[WA DEBUG] API Error in /whatsapp/start:", err);
         res.status(500).json({ error: err.message });
     }
 });
