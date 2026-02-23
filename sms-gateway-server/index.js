@@ -28,6 +28,9 @@ const ADMIN_PASS = "admin";
 const app = express();
 const server = http.createServer(app);
 
+// --- 🛡️ PROXY FIX FOR RATE LIMIT ON RENDER ---
+app.set('trust proxy', 1);
+
 // --- 🛡️ SECURITY MIDDLEWARE ---
 app.use(helmet()); 
 
@@ -80,7 +83,7 @@ const UserSchema = new mongoose.Schema({
 
 const User = mongoose.model('User', UserSchema);
 
-// 2. MESSAGE SCHEMA (🆕 NEW ADDITION)
+// 2. MESSAGE SCHEMA
 const MessageSchema = new mongoose.Schema({
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     phone: { type: String, required: true },
@@ -218,7 +221,7 @@ app.delete('/admin/user/:id', async (req, res) => {
     }
 });
 
-// --- 📜 GET MESSAGE HISTORY (🆕 NEW ROUTE) ---
+// --- 📜 GET MESSAGE HISTORY ---
 app.get('/user/messages', async (req, res) => {
     try {
         const { apiKey } = req.query; 
@@ -253,7 +256,22 @@ app.get('/whatsapp/start', async (req, res) => {
 
         const client = new Client({
             authStrategy: new LocalAuth({ clientId: userIdStr }),
-            puppeteer: { args: ['--no-sandbox', '--disable-setuid-sandbox'] }
+            puppeteer: { 
+                args: [
+                    '--no-sandbox', 
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-accelerated-2d-canvas',
+                    '--no-first-run',
+                    '--no-zygote',
+                    '--single-process',
+                    '--disable-gpu'
+                ] 
+            },
+            webVersionCache: {
+                type: 'remote',
+                remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html'
+            }
         });
 
         waClients.set(userIdStr, client);
@@ -312,7 +330,7 @@ io.on('connection', async (socket) => {
     });
 });
 
-// --- 🚀 SEND SMS API (UPDATED WITH LOGS) ---
+// --- 🚀 SEND SMS API ---
 app.post('/send-message', async (req, res) => {
     try {
         const { apiKey, phone, msg, webhookUrl, type = 'sms' } = req.body;
