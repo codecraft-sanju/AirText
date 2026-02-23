@@ -19,7 +19,9 @@
     "helmet": "^8.1.0",
     "jsonwebtoken": "^9.0.3",
     "mongoose": "^9.2.1",
+    "qrcode": "^1.5.4",
     "socket.io": "^4.8.3",
-    "uuid": "^13.0.0"
+    "uuid": "^13.0.0",
+    "whatsapp-web.js": "^1.34.6"
   }
 }
