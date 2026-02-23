@@ -256,9 +256,11 @@ app.get('/whatsapp/start', async (req, res) => {
 
         console.log(`[WA DEBUG] ⏳ Starting initialization for user: ${user.email}`);
 
+        // --- CHANGES MADE HERE: Updated Puppeteer args and added webVersionCache ---
         const client = new Client({
             authStrategy: new LocalAuth({ clientId: userIdStr }),
             puppeteer: { 
+                headless: true,
                 args: [
                     '--no-sandbox', 
                     '--disable-setuid-sandbox',
@@ -267,13 +269,15 @@ app.get('/whatsapp/start', async (req, res) => {
                     '--no-first-run',
                     '--no-zygote',
                     '--single-process',
-                    '--disable-gpu',
-                    // --- 🔥 CORE FIX: Faking a real Windows Chrome Browser ---
-                    '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+                    '--disable-gpu'
                 ] 
             },
-            // Note: webVersionCache is explicitly removed so WhatsApp fetches the latest supported stable web bundle natively.
+            webVersionCache: {
+                type: 'remote',
+                remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html',
+            }
         });
+        // --- END OF CHANGES ---
 
         waClients.set(userIdStr, client);
 
