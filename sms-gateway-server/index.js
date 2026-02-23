@@ -372,7 +372,8 @@ app.get('/whatsapp/start', async (req, res) => {
 
         const userIdStr = user._id.toString();
 
-        if (waSockets.has(userIdStr) && user.waStatus === 'Connected') {
+        // 🚨 YAHAN FIX KIYA HAI: Naya QR mangne par doosra socket nahi banayega agar purana QR de raha hai.
+        if (waSockets.has(userIdStr)) {
             return res.json({ success: true, message: "Client exists", status: user.waStatus, qr: user.waQr });
         }
 
