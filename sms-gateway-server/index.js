@@ -1,7 +1,4 @@
 require('dotenv').config();
-const path = require('path');
-process.env.PUPPETEER_CACHE_DIR = path.join(__dirname, '.cache', 'puppeteer');
-
 const express = require('express');
 const http = require('http');
 const { Server } = require("socket.io");
@@ -12,8 +9,18 @@ const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode');
+const pino = require('pino');
+
+// --- 🟢 BAILEYS IMPORTS ---
+const { 
+    default: makeWASocket, 
+    DisconnectReason, 
+    initAuthCreds, 
+    BufferJSON, 
+    proto, 
+    Browsers 
+} = require('@whiskeysockets/baileys');
 
 // --- 🌍 CONFIGURATION ---
 const PORT = process.env.PORT || 3000;
@@ -80,7 +87,6 @@ const UserSchema = new mongoose.Schema({
     waStatus: { type: String, default: 'Disconnected' },
     waQr: { type: String, default: null }
 });
-
 const User = mongoose.model('User', UserSchema);
 
 // 2. MESSAGE SCHEMA
@@ -94,17 +100,80 @@ const MessageSchema = new mongoose.Schema({
     webhookUrl: { type: String },
     createdAt: { type: Date, default: Date.now }
 });
-
 const Message = mongoose.model('Message', MessageSchema);
+
+// 3. WHATSAPP AUTH SCHEMA (New for Baileys Session Management)
+const WaAuthSchema = new mongoose.Schema({
+    userId: { type: String, required: true },
+    key: { type: String, required: true },
+    value: { type: String, required: true }
+});
+WaAuthSchema.index({ userId: 1, key: 1 }, { unique: true });
+const WaAuth = mongoose.model('WaAuth', WaAuthSchema);
 
 const deviceSocketMap = new Map(); 
 const deviceUserMap = new Map();
 const deviceCooldowns = new Map();
-const waClients = new Map();
+const waSockets = new Map();
+
+// --- 🟢 MONGODB AUTH ADAPTER FOR BAILEYS ---
+const useMongoDBAuthState = async (userId) => {
+    const writeData = async (data, key) => {
+        const value = JSON.stringify(data, BufferJSON.replacer);
+        await WaAuth.findOneAndUpdate(
+            { userId, key },
+            { value },
+            { upsert: true, new: true }
+        );
+    };
+
+    const readData = async (key) => {
+        const doc = await WaAuth.findOne({ userId, key });
+        if (doc) return JSON.parse(doc.value, BufferJSON.reviver);
+        return null;
+    };
+
+    const removeData = async (key) => {
+        await WaAuth.deleteOne({ userId, key });
+    };
+
+    let creds = await readData('creds') || initAuthCreds();
+
+    return {
+        state: {
+            creds,
+            keys: {
+                get: async (type, ids) => {
+                    const data = {};
+                    await Promise.all(ids.map(async id => {
+                        let value = await readData(`${type}-${id}`);
+                        if (type === 'app-state-sync-key' && value) {
+                            value = proto.Message.AppStateSyncKeyData.fromObject(value);
+                        }
+                        data[id] = value;
+                    }));
+                    return data;
+                },
+                set: async (data) => {
+                    const tasks = [];
+                    for (const category in data) {
+                        for (const id in data[category]) {
+                            const value = data[category][id];
+                            const key = `${category}-${id}`;
+                            tasks.push(value ? writeData(value, key) : removeData(key));
+                        }
+                    }
+                    await Promise.all(tasks);
+                }
+            }
+        },
+        saveCreds: () => writeData(creds, 'creds')
+    };
+};
 
 // --- 🏠 BASIC ROUTE ---
 app.get('/', (req, res) => {
-    res.send(`<h1>Gateway Server Running 🚀</h1>`);
+    res.send(`<h1>Gateway Server Running 🚀 (Baileys Engine)</h1>`);
 });
 
 // --- 🔐 AUTH ROUTES ---
@@ -135,7 +204,6 @@ app.post('/auth/login', async (req, res) => {
     try {
         const { email, password } = req.body;
 
-        // --- 👑 ADMIN LOGIN CHECK ---
         if (email === ADMIN_EMAIL && password === ADMIN_PASS) {
             return res.json({
                 success: true,
@@ -167,8 +235,6 @@ app.post('/auth/login', async (req, res) => {
 });
 
 // --- 👑 ADMIN ROUTES ---
-
-// 1. Get All Users (With Online Status)
 app.get('/admin/users', async (req, res) => {
     try {
         const users = await User.find({}).sort({ lastSeen: -1 }); 
@@ -193,7 +259,6 @@ app.get('/admin/users', async (req, res) => {
     }
 });
 
-// 2. Delete User
 app.delete('/admin/user/:id', async (req, res) => {
     try {
         const { id } = req.params;
@@ -207,11 +272,14 @@ app.delete('/admin/user/:id', async (req, res) => {
                 deviceUserMap.delete(deletedUser.deviceId);
                 deviceCooldowns.delete(deletedUser.deviceId);
             }
-            if (waClients.has(deletedUser._id.toString())) {
-                const client = waClients.get(deletedUser._id.toString());
-                client.destroy();
-                waClients.delete(deletedUser._id.toString());
+            if (waSockets.has(id)) {
+                const sock = waSockets.get(id);
+                sock.logout();
+                waSockets.delete(id);
             }
+            // Clear WhatsApp Auth data for deleted user
+            await WaAuth.deleteMany({ userId: id });
+            
             res.json({ success: true, message: "User Deleted Successfully" });
         } else {
             res.status(404).json({ success: false, message: "User not found" });
@@ -240,6 +308,60 @@ app.get('/user/messages', async (req, res) => {
     }
 });
 
+// --- 🟢 BAILEYS INITIALIZATION LOGIC ---
+async function startBaileysConnection(userIdStr, userDoc) {
+    console.log(`[WA DEBUG] ⏳ Starting Baileys for user: ${userDoc.email}`);
+    
+    const { state, saveCreds } = await useMongoDBAuthState(userIdStr);
+
+    const sock = makeWASocket({
+        auth: state,
+        printQRInTerminal: false,
+        browser: Browsers.macOS('Desktop'),
+        logger: pino({ level: 'silent' }), // Hides extra logs
+        syncFullHistory: false // Saves RAM
+    });
+
+    waSockets.set(userIdStr, sock);
+
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr } = update;
+
+        if (qr) {
+            console.log(`[WA DEBUG] 🟩 QR Code Generated for ${userDoc.email}`);
+            try {
+                const qrDataURL = await qrcode.toDataURL(qr);
+                await User.findByIdAndUpdate(userIdStr, { waQr: qrDataURL, waStatus: 'QR_Ready' });
+            } catch (error) {
+                console.error("[WA DEBUG] ❌ QR Generation Error:", error);
+            }
+        }
+
+        if (connection === 'close') {
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+            
+            console.log(`[WA DEBUG] 🔌 Connection closed. Reconnecting: ${shouldReconnect}`);
+            
+            if (shouldReconnect) {
+                // Wait briefly before reconnecting
+                setTimeout(() => startBaileysConnection(userIdStr, userDoc), 5000);
+            } else {
+                console.log(`[WA DEBUG] 🚪 User Logged out: ${userDoc.email}`);
+                await User.findByIdAndUpdate(userIdStr, { waQr: null, waStatus: 'Disconnected' });
+                await WaAuth.deleteMany({ userId: userIdStr });
+                waSockets.delete(userIdStr);
+            }
+        } else if (connection === 'open') {
+            console.log(`[WA DEBUG] ✅ WhatsApp Ready for User: ${userDoc.email}`);
+            await User.findByIdAndUpdate(userIdStr, { waQr: null, waStatus: 'Connected' });
+        }
+    });
+}
+
+// --- 🌐 WHATSAPP START ROUTE ---
 app.get('/whatsapp/start', async (req, res) => {
     try {
         const { apiKey } = req.query;
@@ -250,73 +372,14 @@ app.get('/whatsapp/start', async (req, res) => {
 
         const userIdStr = user._id.toString();
 
-        if (waClients.has(userIdStr)) {
+        if (waSockets.has(userIdStr) && user.waStatus === 'Connected') {
             return res.json({ success: true, message: "Client exists", status: user.waStatus, qr: user.waQr });
         }
 
-        console.log(`[WA DEBUG] ⏳ Starting initialization for user: ${user.email}`);
+        // Initialize connection
+        await startBaileysConnection(userIdStr, user);
 
-        // --- CHANGES MADE HERE: Updated Puppeteer args and added webVersionCache ---
-        const client = new Client({
-            authStrategy: new LocalAuth({ clientId: userIdStr }),
-            puppeteer: { 
-                headless: true,
-                args: [
-                    '--no-sandbox', 
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-accelerated-2d-canvas',
-                    '--no-first-run',
-                    '--no-zygote',
-                    '--single-process',
-                    '--disable-gpu'
-                ] 
-            },
-            webVersionCache: {
-                type: 'remote',
-                remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html',
-            }
-        });
-        // --- END OF CHANGES ---
-
-        waClients.set(userIdStr, client);
-
-        client.on('loading_screen', (percent, message) => {
-            console.log(`[WA DEBUG] 🔄 Loading WhatsApp Web: ${percent}% - ${message}`);
-        });
-
-        client.on('qr', async (qr) => {
-            console.log(`[WA DEBUG] 🟩 QR Code Generated for ${user.email}`);
-            try {
-                const qrDataURL = await qrcode.toDataURL(qr);
-                await User.findByIdAndUpdate(user._id, { waQr: qrDataURL, waStatus: 'QR_Ready' });
-            } catch (error) {
-                console.error("[WA DEBUG] ❌ QR Generation Error:", error);
-            }
-        });
-
-        client.on('ready', async () => {
-            console.log(`[WA DEBUG] ✅ WhatsApp Ready for User: ${user.email}`);
-            await User.findByIdAndUpdate(user._id, { waQr: null, waStatus: 'Connected' });
-        });
-
-        client.on('authenticated', () => {
-            console.log(`[WA DEBUG] 🔐 WhatsApp Authenticated for User: ${user.email}`);
-        });
-
-        client.on('auth_failure', msg => {
-            console.error(`[WA DEBUG] ❌ WhatsApp Auth Failure for ${user.email}:`, msg);
-        });
-
-        client.on('disconnected', async (reason) => {
-            console.log(`[WA DEBUG] 🔌 WhatsApp Disconnected for User: ${user.email} | Reason: ${reason}`);
-            await User.findByIdAndUpdate(user._id, { waQr: null, waStatus: 'Disconnected' });
-            waClients.delete(userIdStr);
-        });
-
-        client.initialize().catch(err => console.error("[WA DEBUG] 🚨 WA Init Error:", err));
-
-        res.json({ success: true, message: "WhatsApp initialization started" });
+        res.json({ success: true, message: "WhatsApp initialization started via Baileys" });
     } catch (err) {
         console.error("[WA DEBUG] API Error in /whatsapp/start:", err);
         res.status(500).json({ error: err.message });
@@ -398,14 +461,18 @@ async function processQueue() {
         let waResult = { sent: false, error: null };
         let requiresCooldown = false;
 
+        // 🟢 BAILEYS MESSAGE SENDING LOGIC
         if (msg.type === 'whatsapp' || msg.type === 'both') {
-            const waClient = waClients.get(user._id.toString());
-            if (waClient && user.waStatus === 'Connected') {
+            const sock = waSockets.get(user._id.toString());
+            if (sock && user.waStatus === 'Connected') {
                 try {
                     let formattedPhone = msg.phone.replace(/[^0-9]/g, '');
-                    if (!formattedPhone.endsWith('@c.us')) formattedPhone += '@c.us';
+                    // Baileys needs '@s.whatsapp.net' for individuals
+                    if (!formattedPhone.endsWith('@s.whatsapp.net')) {
+                        formattedPhone += '@s.whatsapp.net';
+                    }
                     
-                    await waClient.sendMessage(formattedPhone, msg.content);
+                    await sock.sendMessage(formattedPhone, { text: msg.content });
                     waResult.sent = true;
                 } catch (err) {
                     waResult.error = err.message;
