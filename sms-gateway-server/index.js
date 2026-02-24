@@ -316,7 +316,7 @@ app.get('/user/messages', async (req, res) => {
     }
 });
 
-// --- 🟢 BAILEYS INITIALIZATION LOGIC ---
+// --- 🟢 BAILEYS INITIALIZATION LOGIC (UPDATED WITH FIX) ---
 async function startBaileysConnection(userIdStr, userDoc) {
     console.log(`[WA DEBUG] ⏳ Starting Baileys for user: ${userDoc.email}`);
     
@@ -325,7 +325,8 @@ async function startBaileysConnection(userIdStr, userDoc) {
     const sock = makeWASocket({
         auth: state,
         printQRInTerminal: false,
-        browser: Browsers.macOS('Desktop'),
+        // ✅ FIX 1: Use Ubuntu/Chrome for Render compatibility to reduce disconnects
+        browser: ["Ubuntu", "Chrome", "20.0.04"], 
         logger: pino({ level: 'silent' }), // Hides extra logs
         syncFullHistory: false // Saves RAM
     });
@@ -349,16 +350,19 @@ async function startBaileysConnection(userIdStr, userDoc) {
 
         if (connection === 'close') {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
             
-            console.log(`[WA DEBUG] 🔌 Connection closed. Reconnecting: ${shouldReconnect}`);
+            // ✅ FIX 2: Check for 401 (Unauthorized) to stop infinite loops
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== 401;
+            
+            console.log(`[WA DEBUG] 🔌 Connection closed. Status: ${statusCode}. Reconnecting: ${shouldReconnect}`);
             
             if (shouldReconnect) {
                 // Wait briefly before reconnecting
                 setTimeout(() => startBaileysConnection(userIdStr, userDoc), 5000);
             } else {
-                console.log(`[WA DEBUG] 🚪 User Logged out: ${userDoc.email}`);
+                console.log(`[WA DEBUG] 🚪 Session invalid or logged out. Clearing data for: ${userDoc.email}`);
                 await User.findByIdAndUpdate(userIdStr, { waQr: null, waStatus: 'Disconnected' });
+                // ✅ FIX 3: Force clear corrupted auth data to allow new QR scan
                 await WaAuth.deleteMany({ userId: userIdStr });
                 waSockets.delete(userIdStr);
             }
