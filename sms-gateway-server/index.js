@@ -316,7 +316,7 @@ app.get('/user/messages', async (req, res) => {
     }
 });
 
-// --- 🟢 BAILEYS INITIALIZATION LOGIC (UPDATED WITH FIX) ---
+// --- 🟢 BAILEYS INITIALIZATION LOGIC (UPDATED WITH 405 FIX) ---
 async function startBaileysConnection(userIdStr, userDoc) {
     console.log(`[WA DEBUG] ⏳ Starting Baileys for user: ${userDoc.email}`);
     
@@ -325,7 +325,7 @@ async function startBaileysConnection(userIdStr, userDoc) {
     const sock = makeWASocket({
         auth: state,
         printQRInTerminal: false,
-        // ✅ FIX 1: Use Ubuntu/Chrome for Render compatibility to reduce disconnects
+        // ✅ FIX 1: Use Ubuntu/Chrome for Render compatibility
         browser: ["Ubuntu", "Chrome", "20.0.04"], 
         logger: pino({ level: 'silent' }), // Hides extra logs
         syncFullHistory: false // Saves RAM
@@ -351,8 +351,10 @@ async function startBaileysConnection(userIdStr, userDoc) {
         if (connection === 'close') {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             
-            // ✅ FIX 2: Check for 401 (Unauthorized) to stop infinite loops
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== 401;
+            // ✅ FIX 2: Check for 401 AND 405 to stop infinite loops on bad session
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut 
+                && statusCode !== 401 
+                && statusCode !== 405; 
             
             console.log(`[WA DEBUG] 🔌 Connection closed. Status: ${statusCode}. Reconnecting: ${shouldReconnect}`);
             
@@ -360,9 +362,9 @@ async function startBaileysConnection(userIdStr, userDoc) {
                 // Wait briefly before reconnecting
                 setTimeout(() => startBaileysConnection(userIdStr, userDoc), 5000);
             } else {
-                console.log(`[WA DEBUG] 🚪 Session invalid or logged out. Clearing data for: ${userDoc.email}`);
+                console.log(`[WA DEBUG] 🚪 Session invalid (401/405) or logged out. Clearing data for: ${userDoc.email}`);
                 await User.findByIdAndUpdate(userIdStr, { waQr: null, waStatus: 'Disconnected' });
-                // ✅ FIX 3: Force clear corrupted auth data to allow new QR scan
+                // ✅ FIX 3: Force clear corrupted auth data so you can scan fresh QR
                 await WaAuth.deleteMany({ userId: userIdStr });
                 waSockets.delete(userIdStr);
             }
