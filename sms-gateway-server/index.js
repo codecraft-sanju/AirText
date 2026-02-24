@@ -9,7 +9,7 @@ const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const qrcode = require('qrcode');
+const qrcode = require('qrcode'); // ✅ REQUIRED: npm install qrcode
 const pino = require('pino');
 
 // --- 🟢 BAILEYS IMPORTS ---
@@ -19,14 +19,15 @@ const {
     initAuthCreds, 
     BufferJSON, 
     proto, 
-    Browsers 
+    Browsers,
+    fetchLatestBaileysVersion
 } = require('@whiskeysockets/baileys');
 
 // --- 🌍 CONFIGURATION ---
 const PORT = process.env.PORT || 3000;
 const MONGO_URI = process.env.MONGO_URI;
 const JWT_SECRET = process.env.JWT_SECRET;
-const FRONTEND_URL = process.env.FRONTEND_URL;
+const FRONTEND_URL = process.env.FRONTEND_URL || "*"; // Allow all for App
 
 // --- 👑 ADMIN CREDENTIALS ---
 const ADMIN_EMAIL = "admin@gmail.com";
@@ -42,7 +43,7 @@ app.set('trust proxy', 1);
 app.use(helmet()); 
 
 const corsOptions = {
-    origin: FRONTEND_URL, 
+    origin: "*", // Allow connections from React Native
     methods: ["GET", "POST", "DELETE"], 
     credentials: true 
 };
@@ -67,23 +68,6 @@ const io = new Server(server, {
     transports: ['websocket', 'polling'] 
 });
 
-// --- 🗄️ DATABASE & SERVER START (CRASH FIX) ---
-mongoose.connect(MONGO_URI)
-    .then(async () => {
-        console.log("✅ MongoDB Connected");
-        
-        // Reset stuck messages on restart
-        await Message.updateMany({ status: 'Processing' }, { $set: { status: 'Pending' } });
-        console.log("🔄 Reset any stuck processing messages to Pending");
-
-        // Start Server ONLY after DB connects
-        server.listen(PORT, () => console.log(`🚀 Production Server running on Port ${PORT}`));
-    })
-    .catch(err => {
-        console.error("❌ MongoDB Error:", err);
-        process.exit(1); // Exit process so Render can restart it
-    });
-
 // 1. USER SCHEMA
 const UserSchema = new mongoose.Schema({
     name: { type: String, required: true },
@@ -92,8 +76,8 @@ const UserSchema = new mongoose.Schema({
     apiKey: { type: String, unique: true },
     deviceId: { type: String, unique: true },
     lastSeen: { type: Date, default: Date.now },
-    waStatus: { type: String, default: 'Disconnected' },
-    waQr: { type: String, default: null }
+    waStatus: { type: String, default: 'Disconnected' }, // Disconnected, QR_Ready, Connected
+    waQr: { type: String, default: null } // Stores the Base64 QR Image
 });
 const User = mongoose.model('User', UserSchema);
 
@@ -110,7 +94,7 @@ const MessageSchema = new mongoose.Schema({
 });
 const Message = mongoose.model('Message', MessageSchema);
 
-// 3. WHATSAPP AUTH SCHEMA (New for Baileys Session Management)
+// 3. WHATSAPP AUTH SCHEMA
 const WaAuthSchema = new mongoose.Schema({
     userId: { type: String, required: true },
     key: { type: String, required: true },
@@ -118,6 +102,28 @@ const WaAuthSchema = new mongoose.Schema({
 });
 WaAuthSchema.index({ userId: 1, key: 1 }, { unique: true });
 const WaAuth = mongoose.model('WaAuth', WaAuthSchema);
+
+// --- 🗄️ DATABASE & SERVER START ---
+mongoose.connect(MONGO_URI)
+    .then(async () => {
+        console.log("✅ MongoDB Connected");
+        
+        // 1. Reset Stuck Messages
+        await Message.updateMany({ status: 'Processing' }, { $set: { status: 'Pending' } });
+        
+        // 2. Reset Stuck WhatsApp Statuses (Crucial for QR Fix)
+        await User.updateMany(
+            { waStatus: 'QR_Ready' }, 
+            { $set: { waStatus: 'Disconnected', waQr: null } }
+        );
+        console.log("🔄 System State Cleaned (Messages & WA Status)");
+
+        server.listen(PORT, () => console.log(`🚀 Production Server running on Port ${PORT}`));
+    })
+    .catch(err => {
+        console.error("❌ MongoDB Error:", err);
+        process.exit(1); 
+    });
 
 const deviceSocketMap = new Map(); 
 const deviceUserMap = new Map();
@@ -127,17 +133,21 @@ const waSockets = new Map();
 // --- 🟢 MONGODB AUTH ADAPTER FOR BAILEYS ---
 const useMongoDBAuthState = async (userId) => {
     const writeData = async (data, key) => {
-        const value = JSON.stringify(data, BufferJSON.replacer);
-        await WaAuth.findOneAndUpdate(
-            { userId, key },
-            { value },
-            { upsert: true, returnDocument: 'after' } // ✅ Fixed Mongoose Syntax
-        );
+        try {
+            const value = JSON.stringify(data, BufferJSON.replacer);
+            await WaAuth.findOneAndUpdate(
+                { userId, key },
+                { value },
+                { upsert: true, new: true } 
+            );
+        } catch(e) { console.error("Auth Write Error", e); }
     };
 
     const readData = async (key) => {
-        const doc = await WaAuth.findOne({ userId, key });
-        if (doc) return JSON.parse(doc.value, BufferJSON.reviver);
+        try {
+            const doc = await WaAuth.findOne({ userId, key });
+            if (doc) return JSON.parse(doc.value, BufferJSON.reviver);
+        } catch(e) { return null; }
         return null;
     };
 
@@ -179,12 +189,73 @@ const useMongoDBAuthState = async (userId) => {
     };
 };
 
-// --- 🏠 BASIC ROUTE ---
+// --- 🟢 BAILEYS LOGIC (QR FIX APPLIED) ---
+async function startBaileysConnection(userIdStr, userDoc) {
+    console.log(`[WA] ⏳ Initializing for ${userDoc.email}`);
+    
+    const { state, saveCreds } = await useMongoDBAuthState(userIdStr);
+    const { version } = await fetchLatestBaileysVersion();
+
+    const sock = makeWASocket({
+        version,
+        auth: state,
+        printQRInTerminal: true, 
+        browser: Browsers.macOS("Desktop"), // ✅ More stable than default
+        logger: pino({ level: 'silent' }),
+        connectTimeoutMs: 60000,
+        syncFullHistory: false
+    });
+
+    waSockets.set(userIdStr, sock);
+
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr } = update;
+
+        if (qr) {
+            console.log(`[WA] ✨ QR Generated for ${userDoc.email}`);
+            try {
+                // ✅ CONVERT QR TEXT TO IMAGE URL
+                const qrDataURL = await qrcode.toDataURL(qr); 
+                await User.findByIdAndUpdate(userIdStr, { waQr: qrDataURL, waStatus: 'QR_Ready' });
+            } catch (error) {
+                console.error("[WA] ❌ QR Gen Error:", error);
+            }
+        }
+
+        if (connection === 'close') {
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            
+            // Reconnect if NOT logged out (401) or Banned/Bad Request (403/405)
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut 
+                && statusCode !== 401 
+                && statusCode !== 403
+                && statusCode !== 405; 
+            
+            console.log(`[WA] 🔴 Closed: ${statusCode}. Reconnect: ${shouldReconnect}`);
+            
+            if (shouldReconnect) {
+                setTimeout(() => startBaileysConnection(userIdStr, userDoc), 4000);
+            } else {
+                console.log(`[WA] 🗑️ Session invalid. Cleaning up.`);
+                await User.findByIdAndUpdate(userIdStr, { waQr: null, waStatus: 'Disconnected' });
+                await WaAuth.deleteMany({ userId: userIdStr }); // Wipe bad session data
+                waSockets.delete(userIdStr);
+            }
+        } else if (connection === 'open') {
+            console.log(`[WA] 🟢 Connected: ${userDoc.email}`);
+            await User.findByIdAndUpdate(userIdStr, { waQr: null, waStatus: 'Connected' });
+        }
+    });
+}
+
+// --- 🏠 ROUTES ---
 app.get('/', (req, res) => {
-    res.send(`<h1>Gateway Server Running 🚀 (Baileys Engine)</h1>`);
+    res.send(`<h1>Gateway Server Running 🚀</h1>`);
 });
 
-// --- 🔐 AUTH ROUTES ---
+// --- 🔐 AUTH ---
 app.post('/auth/register', async (req, res) => {
     try {
         const { name, email, password } = req.body;
@@ -203,7 +274,6 @@ app.post('/auth/register', async (req, res) => {
 
         res.status(201).json({ success: true, message: "User Registered!", apiKey, deviceId });
     } catch (err) {
-        console.error("Register Error:", err);
         res.status(500).json({ error: "Server Error" });
     }
 });
@@ -211,16 +281,12 @@ app.post('/auth/register', async (req, res) => {
 app.post('/auth/login', async (req, res) => {
     try {
         const { email, password } = req.body;
-
         if (email === ADMIN_EMAIL && password === ADMIN_PASS) {
             return res.json({
-                success: true,
-                role: 'admin', 
-                token: 'admin-super-secret-token',
+                success: true, role: 'admin', token: 'admin-token',
                 user: { name: 'Admin', email: ADMIN_EMAIL }
             });
         }
-
         const user = await User.findOne({ email });
         if (!user) return res.status(400).json({ message: "User not found" });
 
@@ -230,155 +296,18 @@ app.post('/auth/login', async (req, res) => {
         const token = jwt.sign({ id: user._id }, JWT_SECRET, { expiresIn: '7d' });
 
         res.json({ 
-            success: true, 
-            role: 'user',
-            token, 
+            success: true, role: 'user', token, 
             user: { name: user.name, apiKey: user.apiKey, deviceId: user.deviceId } 
         });
-
     } catch (err) {
-        console.error("Login Error:", err);
         res.status(500).json({ error: "Server Error" });
     }
 });
 
-// --- 👑 ADMIN ROUTES ---
-app.get('/admin/users', async (req, res) => {
-    try {
-        const users = await User.find({}).sort({ lastSeen: -1 }); 
-        
-        const userList = users.map(user => {
-            const isOnline = deviceSocketMap.has(user.deviceId);
-            return {
-                _id: user._id,
-                name: user.name,
-                email: user.email,
-                deviceId: user.deviceId,
-                apiKey: user.apiKey,
-                lastSeen: user.lastSeen,
-                isOnline: isOnline,
-                waStatus: user.waStatus
-            };
-        });
-
-        res.json({ success: true, users: userList });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-app.delete('/admin/user/:id', async (req, res) => {
-    try {
-        const { id } = req.params;
-        const deletedUser = await User.findByIdAndDelete(id);
-        
-        if (deletedUser) {
-            const socketId = deviceSocketMap.get(deletedUser.deviceId);
-            if (socketId) {
-                io.to(socketId).disconnectSockets(); 
-                deviceSocketMap.delete(deletedUser.deviceId);
-                deviceUserMap.delete(deletedUser.deviceId);
-                deviceCooldowns.delete(deletedUser.deviceId);
-            }
-            if (waSockets.has(id)) {
-                const sock = waSockets.get(id);
-                sock.logout();
-                waSockets.delete(id);
-            }
-            // Clear WhatsApp Auth data for deleted user
-            await WaAuth.deleteMany({ userId: id });
-            
-            res.json({ success: true, message: "User Deleted Successfully" });
-        } else {
-            res.status(404).json({ success: false, message: "User not found" });
-        }
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// --- 📜 GET MESSAGE HISTORY ---
-app.get('/user/messages', async (req, res) => {
-    try {
-        const { apiKey } = req.query; 
-        if (!apiKey) return res.status(400).json({ success: false, message: "API Key required" });
-
-        const user = await User.findOne({ apiKey });
-        if (!user) return res.status(401).json({ success: false, message: "Invalid API Key" });
-
-        const messages = await Message.find({ userId: user._id })
-            .sort({ createdAt: -1 }) 
-            .limit(50);
-
-        res.json({ success: true, messages });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// --- 🟢 BAILEYS INITIALIZATION LOGIC (UPDATED WITH 405 FIX) ---
-async function startBaileysConnection(userIdStr, userDoc) {
-    console.log(`[WA DEBUG] ⏳ Starting Baileys for user: ${userDoc.email}`);
-    
-    const { state, saveCreds } = await useMongoDBAuthState(userIdStr);
-
-    const sock = makeWASocket({
-        auth: state,
-        printQRInTerminal: false,
-     
-browser: ["Windows", "Chrome", "10"],
-        logger: pino({ level: 'silent' }), // Hides extra logs
-        syncFullHistory: false // Saves RAM
-    });
-
-    waSockets.set(userIdStr, sock);
-
-    sock.ev.on('creds.update', saveCreds);
-
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
-
-        if (qr) {
-            console.log(`[WA DEBUG] 🟩 QR Code Generated for ${userDoc.email}`);
-            try {
-                const qrDataURL = await qrcode.toDataURL(qr);
-                await User.findByIdAndUpdate(userIdStr, { waQr: qrDataURL, waStatus: 'QR_Ready' });
-            } catch (error) {
-                console.error("[WA DEBUG] ❌ QR Generation Error:", error);
-            }
-        }
-
-        if (connection === 'close') {
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
-            
-            // ✅ FIX 2: Check for 401 AND 405 to stop infinite loops on bad session
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut 
-                && statusCode !== 401 
-                && statusCode !== 405; 
-            
-            console.log(`[WA DEBUG] 🔌 Connection closed. Status: ${statusCode}. Reconnecting: ${shouldReconnect}`);
-            
-            if (shouldReconnect) {
-                // Wait briefly before reconnecting
-                setTimeout(() => startBaileysConnection(userIdStr, userDoc), 5000);
-            } else {
-                console.log(`[WA DEBUG] 🚪 Session invalid (401/405) or logged out. Clearing data for: ${userDoc.email}`);
-                await User.findByIdAndUpdate(userIdStr, { waQr: null, waStatus: 'Disconnected' });
-                // ✅ FIX 3: Force clear corrupted auth data so you can scan fresh QR
-                await WaAuth.deleteMany({ userId: userIdStr });
-                waSockets.delete(userIdStr);
-            }
-        } else if (connection === 'open') {
-            console.log(`[WA DEBUG] ✅ WhatsApp Ready for User: ${userDoc.email}`);
-            await User.findByIdAndUpdate(userIdStr, { waQr: null, waStatus: 'Connected' });
-        }
-    });
-}
-
-// --- 🌐 WHATSAPP START ROUTE ---
+// --- 🌐 WHATSAPP MANAGEMENT (FIXED) ---
 app.get('/whatsapp/start', async (req, res) => {
     try {
-        const { apiKey } = req.query;
+        const { apiKey, force } = req.query; // ✅ Added force param
         if (!apiKey) return res.status(400).json({ success: false, message: "API Key required" });
 
         const user = await User.findOne({ apiKey });
@@ -386,47 +315,30 @@ app.get('/whatsapp/start', async (req, res) => {
 
         const userIdStr = user._id.toString();
 
-        if (waSockets.has(userIdStr)) {
-            return res.json({ success: true, message: "Client exists", status: user.waStatus, qr: user.waQr });
+        // ✅ FORCE RESET LOGIC
+        if (force === 'true') {
+            console.log(`[WA] ⚠️ Force Restarting ${user.email}`);
+            if (waSockets.has(userIdStr)) {
+                try { waSockets.get(userIdStr).end(undefined); } catch(e){}
+                waSockets.delete(userIdStr);
+            }
+            await WaAuth.deleteMany({ userId: userIdStr }); // Clear DB Session
+            await User.findByIdAndUpdate(userIdStr, { waQr: null, waStatus: 'Disconnected' });
+        } else if (waSockets.has(userIdStr)) {
+            // If already running, return status
+            return res.json({ success: true, message: "Client active", status: user.waStatus, qr: user.waQr });
         }
 
-        // Initialize connection
-        await startBaileysConnection(userIdStr, user);
+        // Start New Connection
+        startBaileysConnection(userIdStr, user);
 
-        res.json({ success: true, message: "WhatsApp initialization started via Baileys" });
+        res.json({ success: true, message: "Initialization started", status: 'Initializing' });
     } catch (err) {
-        console.error("[WA DEBUG] API Error in /whatsapp/start:", err);
         res.status(500).json({ error: err.message });
     }
 });
 
-// --- 🔌 SOCKET CONNECTION LOGIC ---
-io.on('connection', async (socket) => {
-    const { deviceId } = socket.handshake.auth;
-    
-    if (!deviceId) return socket.disconnect();
-
-    const user = await User.findOne({ deviceId });
-    if (!user) {
-        console.log(`🚫 Unknown Device: ${deviceId}`);
-        return socket.disconnect();
-    }
-
-    console.log(`✅ Online: ${user.name} (${deviceId})`);
-    deviceSocketMap.set(deviceId, socket.id);
-    deviceUserMap.set(deviceId, user._id);
-    
-    user.lastSeen = new Date();
-    await user.save();
-
-    socket.on('disconnect', () => {
-        console.log(`❌ Offline: ${user.name}`);
-        deviceSocketMap.delete(deviceId);
-        deviceUserMap.delete(deviceId);
-    });
-});
-
-// --- 🚀 SEND SMS API ---
+// --- 🚀 MESSAGING API ---
 app.post('/send-message', async (req, res) => {
     try {
         const { apiKey, phone, msg, webhookUrl, type = 'sms' } = req.body;
@@ -434,33 +346,80 @@ app.post('/send-message', async (req, res) => {
         if(!apiKey || !phone || !msg) 
             return res.status(400).json({ success: false, message: "Missing parameters" });
 
-        if (!['sms', 'whatsapp', 'both'].includes(type)) {
-            return res.status(400).json({ success: false, message: "Invalid type. Use sms, whatsapp, or both" });
-        }
-        
         const user = await User.findOne({ apiKey });
         if (!user) return res.status(401).json({ success: false, message: "Invalid API Key" });
 
         const newMessage = new Message({
-            userId: user._id,
-            phone,
-            content: msg,
-            type,
-            status: 'Pending',
-            webhookUrl: webhookUrl || null
+            userId: user._id, phone, content: msg, type,
+            status: 'Pending', webhookUrl: webhookUrl || null
         });
         await newMessage.save();
 
         res.status(202).json({ success: true, message: "Message Queued", messageId: newMessage._id });
-
     } catch (err) {
-        console.error("API Error:", err);
-        if (!res.headersSent) {
-            res.status(500).json({ error: err.message });
-        }
+        res.status(500).json({ error: err.message });
     }
 });
 
+app.get('/user/messages', async (req, res) => {
+    try {
+        const { apiKey } = req.query; 
+        const user = await User.findOne({ apiKey });
+        if (!user) return res.status(401).json({ success: false });
+        const messages = await Message.find({ userId: user._id }).sort({ createdAt: -1 }).limit(50);
+        res.json({ success: true, messages });
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/admin/users', async (req, res) => {
+    const users = await User.find({}).sort({ lastSeen: -1 });
+    const userList = users.map(u => ({
+        ...u._doc,
+        isOnline: deviceSocketMap.has(u.deviceId)
+    }));
+    res.json({ success: true, users: userList });
+});
+
+app.delete('/admin/user/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const deletedUser = await User.findByIdAndDelete(id);
+        if (deletedUser) {
+            // Clean up sockets & auth
+            const socketId = deviceSocketMap.get(deletedUser.deviceId);
+            if (socketId) io.to(socketId).disconnectSockets();
+            if (waSockets.has(id)) { waSockets.get(id).end(undefined); waSockets.delete(id); }
+            await WaAuth.deleteMany({ userId: id });
+            
+            res.json({ success: true });
+        } else {
+            res.status(404).json({ success: false });
+        }
+    } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// --- 🔌 DEVICE SOCKET ---
+io.on('connection', async (socket) => {
+    const { deviceId } = socket.handshake.auth;
+    if (!deviceId) return socket.disconnect();
+
+    const user = await User.findOne({ deviceId });
+    if (!user) return socket.disconnect();
+
+    console.log(`✅ Device Online: ${user.name}`);
+    deviceSocketMap.set(deviceId, socket.id);
+    deviceUserMap.set(deviceId, user._id);
+    
+    user.lastSeen = new Date();
+    await user.save();
+
+    socket.on('disconnect', () => {
+        deviceSocketMap.delete(deviceId);
+        deviceUserMap.delete(deviceId);
+    });
+});
+
+// --- 🔄 QUEUE PROCESSOR ---
 async function processQueue() {
     const pendingMessages = await Message.find({ status: 'Pending' }).sort({ createdAt: 1 }).limit(10);
 
@@ -475,27 +434,20 @@ async function processQueue() {
         let waResult = { sent: false, error: null };
         let requiresCooldown = false;
 
-        // 🟢 BAILEYS MESSAGE SENDING LOGIC
+        // 1. Send via WhatsApp
         if (msg.type === 'whatsapp' || msg.type === 'both') {
             const sock = waSockets.get(user._id.toString());
             if (sock && user.waStatus === 'Connected') {
                 try {
                     let formattedPhone = msg.phone.replace(/[^0-9]/g, '');
-                    // Baileys needs '@s.whatsapp.net' for individuals
-                    if (!formattedPhone.endsWith('@s.whatsapp.net')) {
-                        formattedPhone += '@s.whatsapp.net';
-                    }
-                    
+                    if (!formattedPhone.endsWith('@s.whatsapp.net')) formattedPhone += '@s.whatsapp.net';
                     await sock.sendMessage(formattedPhone, { text: msg.content });
                     waResult.sent = true;
-                } catch (err) {
-                    waResult.error = err.message;
-                }
-            } else {
-                waResult.error = 'WhatsApp not connected';
-            }
+                } catch (err) { waResult.error = err.message; }
+            } else { waResult.error = 'WhatsApp not connected'; }
         }
 
+        // 2. Send via SMS (Android)
         if (msg.type === 'sms' || msg.type === 'both') {
             const deviceId = user.deviceId;
             const socketId = deviceSocketMap.get(deviceId);
@@ -503,44 +455,27 @@ async function processQueue() {
 
             if (socketId) {
                 if (Date.now() < cooldown) {
-                    msg.status = 'Pending';
-                    await msg.save();
-                    continue; 
+                    msg.status = 'Pending'; await msg.save(); continue;
                 }
-
                 requiresCooldown = true;
                 const targetSocket = io.sockets.sockets.get(socketId);
                 
-                if (targetSocket) {
-                    try {
-                        const response = await new Promise((resolve, reject) => {
-                            const timeout = setTimeout(() => reject(new Error('Device Timeout')), 15000);
-                            targetSocket.emit('send_sms_command', { phone: msg.phone, msg: msg.content, id: msg._id }, (res) => {
-                                clearTimeout(timeout);
-                                resolve(res);
-                            });
+                try {
+                    const response = await new Promise((resolve, reject) => {
+                        const timeout = setTimeout(() => reject(new Error('Timeout')), 15000);
+                        targetSocket.emit('send_sms_command', { phone: msg.phone, msg: msg.content, id: msg._id }, (res) => {
+                            clearTimeout(timeout); resolve(res);
                         });
-                        
-                        if (response && response.success) {
-                            smsResult.sent = true;
-                        } else {
-                            smsResult.error = response ? response.error : "App reported failure";
-                        }
-                    } catch (err) {
-                        smsResult.error = err.message;
-                    }
-                } else {
-                    smsResult.error = 'Device Disconnected before sending';
-                }
-            } else {
-                smsResult.error = 'Device Offline';
-            }
+                    });
+                    if (response && response.success) smsResult.sent = true;
+                    else smsResult.error = response ? response.error : "Failed";
+                } catch (err) { smsResult.error = err.message; }
+            } else { smsResult.error = 'Device Offline'; }
         }
 
-        if (requiresCooldown) {
-            deviceCooldowns.set(user.deviceId, Date.now() + 20000);
-        }
+        if (requiresCooldown) deviceCooldowns.set(user.deviceId, Date.now() + 5000);
 
+        // 3. Final Status Update
         let finalStatus = 'Failed';
         let errorMessages = [];
 
@@ -554,7 +489,6 @@ async function processQueue() {
             if (smsResult.sent && waResult.sent) finalStatus = 'Sent';
             else if (smsResult.sent || waResult.sent) finalStatus = 'Partial';
             else finalStatus = 'Failed';
-
             if (smsResult.error) errorMessages.push(`SMS: ${smsResult.error}`);
             if (waResult.error) errorMessages.push(`WA: ${waResult.error}`);
         }
@@ -563,22 +497,18 @@ async function processQueue() {
         if (errorMessages.length > 0) msg.errorMessage = errorMessages.join(' | ');
         await msg.save();
 
+        // 4. Webhook Trigger
         if (msg.webhookUrl) {
             try {
                 await fetch(msg.webhookUrl, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        messageId: msg._id,
-                        phone: msg.phone,
-                        type: msg.type,
-                        status: msg.status,
-                        errorMessage: msg.errorMessage
+                        messageId: msg._id, phone: msg.phone, type: msg.type,
+                        status: msg.status, errorMessage: msg.errorMessage
                     })
                 });
-            } catch (webhookError) {
-                console.error("Webhook Error:", webhookError.message);
-            }
+            } catch (e) { console.error("Webhook Fail", e.message); }
         }
     }
 }
