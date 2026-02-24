@@ -67,14 +67,22 @@ const io = new Server(server, {
     transports: ['websocket', 'polling'] 
 });
 
-// --- 🗄️ DATABASE ---
+// --- 🗄️ DATABASE & SERVER START (CRASH FIX) ---
 mongoose.connect(MONGO_URI)
     .then(async () => {
         console.log("✅ MongoDB Connected");
+        
+        // Reset stuck messages on restart
         await Message.updateMany({ status: 'Processing' }, { $set: { status: 'Pending' } });
         console.log("🔄 Reset any stuck processing messages to Pending");
+
+        // Start Server ONLY after DB connects
+        server.listen(PORT, () => console.log(`🚀 Production Server running on Port ${PORT}`));
     })
-    .catch(err => console.error("❌ MongoDB Error:", err));
+    .catch(err => {
+        console.error("❌ MongoDB Error:", err);
+        process.exit(1); // Exit process so Render can restart it
+    });
 
 // 1. USER SCHEMA
 const UserSchema = new mongoose.Schema({
@@ -123,7 +131,7 @@ const useMongoDBAuthState = async (userId) => {
         await WaAuth.findOneAndUpdate(
             { userId, key },
             { value },
-            { upsert: true, new: true }
+            { upsert: true, returnDocument: 'after' } // ✅ Fixed Mongoose Syntax
         );
     };
 
@@ -372,7 +380,6 @@ app.get('/whatsapp/start', async (req, res) => {
 
         const userIdStr = user._id.toString();
 
-        // 🚨 YAHAN FIX KIYA HAI: Naya QR mangne par doosra socket nahi banayega agar purana QR de raha hai.
         if (waSockets.has(userIdStr)) {
             return res.json({ success: true, message: "Client exists", status: user.waStatus, qr: user.waQr });
         }
@@ -571,5 +578,3 @@ async function processQueue() {
 }
 
 setInterval(processQueue, 2000);
-
-server.listen(PORT, () => console.log(`🚀 Production Server running on Port ${PORT}`));
