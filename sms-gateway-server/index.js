@@ -325,8 +325,8 @@ async function startBaileysConnection(userIdStr, userDoc) {
     const sock = makeWASocket({
         auth: state,
         printQRInTerminal: false,
-        // ✅ FIX 1: Use Ubuntu/Chrome for Render compatibility
-        browser: ["Ubuntu", "Chrome", "20.0.04"], 
+     
+browser: ["Windows", "Chrome", "10"],
         logger: pino({ level: 'silent' }), // Hides extra logs
         syncFullHistory: false // Saves RAM
     });
