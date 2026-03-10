@@ -57,6 +57,13 @@ const limiter = rateLimit({
 });
 app.use('/auth', limiter);
 
+// ---> CHANGED: API RATE LIMITER FOR SEND-MESSAGE (Security)
+const sendMessageLimiter = rateLimit({
+    windowMs: 1 * 60 * 1000, // 1 minute
+    max: 60, // Max 60 requests per minute per IP
+    message: { success: false, message: "Too many requests. Please wait a minute." }
+});
+
 // --- 🔌 SOCKET.IO SETUP (Mobile Optimized) ---
 const io = new Server(server, {
     cors: { 
@@ -339,7 +346,8 @@ app.get('/whatsapp/start', async (req, res) => {
 });
 
 // --- 🚀 MESSAGING API ---
-app.post('/send-message', async (req, res) => {
+// ---> CHANGED: Added sendMessageLimiter middleware here
+app.post('/send-message', sendMessageLimiter, async (req, res) => {
     try {
         const { apiKey, phone, msg, webhookUrl, type = 'sms' } = req.body;
 
@@ -421,11 +429,33 @@ io.on('connection', async (socket) => {
 
 // --- 🔄 QUEUE PROCESSOR ---
 async function processQueue() {
-    const pendingMessages = await Message.find({ status: 'Pending' }).sort({ createdAt: 1 }).limit(10);
+    const pendingMessages = await Message.find({ status: 'Pending' }).sort({ createdAt: 1 }).limit(50);
 
     for (const msg of pendingMessages) {
         const user = await User.findById(msg.userId);
         if (!user) continue;
+
+        // Expired OTP Logic
+        const EXPIRY_TIME_MS = 3 * 60 * 1000;
+        if (Date.now() - new Date(msg.createdAt).getTime() > EXPIRY_TIME_MS) {
+            msg.status = 'Failed';
+            msg.errorMessage = 'Expired (Older than 3 mins)';
+            await msg.save();
+            
+            if (msg.webhookUrl) {
+                try {
+                    await fetch(msg.webhookUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            messageId: msg._id, phone: msg.phone, type: msg.type,
+                            status: msg.status, errorMessage: msg.errorMessage
+                        })
+                    });
+                } catch (e) { console.error("Webhook Fail", e.message); }
+            }
+            continue; 
+        }
 
         msg.status = 'Processing';
         await msg.save();
@@ -441,6 +471,12 @@ async function processQueue() {
                 try {
                     let formattedPhone = msg.phone.replace(/[^0-9]/g, '');
                     if (!formattedPhone.endsWith('@s.whatsapp.net')) formattedPhone += '@s.whatsapp.net';
+                    
+                    // ---> CHANGED: WHATSAPP ANTI-BAN RANDOM DELAY
+                    // WhatsApp message bhejne se pehle 2 se 5 second ka gap (Human Behavior)
+                    const randomDelay = Math.floor(Math.random() * (5000 - 2000 + 1)) + 2000;
+                    await new Promise(resolve => setTimeout(resolve, randomDelay));
+
                     await sock.sendMessage(formattedPhone, { text: msg.content });
                     waResult.sent = true;
                 } catch (err) { waResult.error = err.message; }
@@ -473,7 +509,7 @@ async function processQueue() {
             } else { smsResult.error = 'Device Offline'; }
         }
 
-        if (requiresCooldown) deviceCooldowns.set(user.deviceId, Date.now() + 5000);
+        if (requiresCooldown) deviceCooldowns.set(user.deviceId, Date.now() + 500);
 
         // 3. Final Status Update
         let finalStatus = 'Failed';
@@ -513,4 +549,4 @@ async function processQueue() {
     }
 }
 
-setInterval(processQueue, 2000);
+setInterval(processQueue, 1000);
