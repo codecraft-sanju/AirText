@@ -94,6 +94,8 @@ const MessageSchema = new mongoose.Schema({
     phone: { type: String, required: true },
     content: { type: String, required: true },
     type: { type: String, enum: ['sms', 'whatsapp', 'both'], default: 'sms' },
+    // --- NEW CHANGES: Added mediaUrls array for WhatsApp photos ---
+    mediaUrls: [{ type: String }], 
     status: { type: String, enum: ['Pending', 'Processing', 'Sent', 'Failed', 'Partial'], default: 'Pending' },
     errorMessage: { type: String }, 
     webhookUrl: { type: String },
@@ -349,7 +351,8 @@ app.get('/whatsapp/start', async (req, res) => {
 // ---> CHANGED: Added sendMessageLimiter middleware here
 app.post('/send-message', sendMessageLimiter, async (req, res) => {
     try {
-        const { apiKey, phone, msg, webhookUrl, type = 'sms' } = req.body;
+        // --- NEW CHANGES: Extract mediaUrls from request body ---
+        const { apiKey, phone, msg, webhookUrl, type = 'sms', mediaUrls = [] } = req.body;
 
         if(!apiKey || !phone || !msg) 
             return res.status(400).json({ success: false, message: "Missing parameters" });
@@ -357,9 +360,13 @@ app.post('/send-message', sendMessageLimiter, async (req, res) => {
         const user = await User.findOne({ apiKey });
         if (!user) return res.status(401).json({ success: false, message: "Invalid API Key" });
 
+        // --- NEW CHANGES: Ensure max 10 URLs just to be safe on the backend ---
+        const finalMediaUrls = Array.isArray(mediaUrls) ? mediaUrls.slice(0, 10) : [];
+
         const newMessage = new Message({
             userId: user._id, phone, content: msg, type,
-            status: 'Pending', webhookUrl: webhookUrl || null
+            status: 'Pending', webhookUrl: webhookUrl || null,
+            mediaUrls: finalMediaUrls // --- NEW CHANGES: Save to DB ---
         });
         await newMessage.save();
 
@@ -477,7 +484,28 @@ async function processQueue() {
                     const randomDelay = Math.floor(Math.random() * (5000 - 2000 + 1)) + 2000;
                     await new Promise(resolve => setTimeout(resolve, randomDelay));
 
-                    await sock.sendMessage(formattedPhone, { text: msg.content });
+                    // --- NEW CHANGES: Media Sending Logic ---
+                    if (msg.mediaUrls && msg.mediaUrls.length > 0) {
+                        // Send the first image with the text message as a caption
+                        await sock.sendMessage(formattedPhone, { 
+                            image: { url: msg.mediaUrls[0] }, 
+                            caption: msg.content 
+                        });
+
+                        // If there are more images, send them without a caption
+                        for (let i = 1; i < msg.mediaUrls.length; i++) {
+                            // Add a small 1.5 second delay between multiple photos to avoid WhatsApp treating it as spam
+                            await new Promise(resolve => setTimeout(resolve, 1500));
+                            await sock.sendMessage(formattedPhone, { 
+                                image: { url: msg.mediaUrls[i] } 
+                            });
+                        }
+                    } else {
+                        // Regular text message if no media URLs exist
+                        await sock.sendMessage(formattedPhone, { text: msg.content });
+                    }
+                    // --- END NEW CHANGES ---
+
                     waResult.sent = true;
                 } catch (err) { waResult.error = err.message; }
             } else { waResult.error = 'WhatsApp not connected'; }
