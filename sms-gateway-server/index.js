@@ -435,20 +435,139 @@ io.on('connection', async (socket) => {
 });
 
 // --- 🔄 QUEUE PROCESSOR ---
+let isProcessingQueue = false;
+
 async function processQueue() {
-    const pendingMessages = await Message.find({ status: 'Pending' }).sort({ createdAt: 1 }).limit(50);
+    if (isProcessingQueue) return;
+    isProcessingQueue = true;
 
-    for (const msg of pendingMessages) {
-        const user = await User.findById(msg.userId);
-        if (!user) continue;
+    try {
+        const pendingMessages = await Message.find({ status: 'Pending' }).sort({ createdAt: 1 }).limit(50);
 
-        // Expired OTP Logic
-        const EXPIRY_TIME_MS = 3 * 60 * 1000;
-        if (Date.now() - new Date(msg.createdAt).getTime() > EXPIRY_TIME_MS) {
-            msg.status = 'Failed';
-            msg.errorMessage = 'Expired (Older than 3 mins)';
+        for (const msg of pendingMessages) {
+            const user = await User.findById(msg.userId);
+            if (!user) continue;
+
+            // Expired OTP Logic
+            const EXPIRY_TIME_MS = 3 * 60 * 1000;
+            if (Date.now() - new Date(msg.createdAt).getTime() > EXPIRY_TIME_MS) {
+                msg.status = 'Failed';
+                msg.errorMessage = 'Expired (Older than 3 mins)';
+                await msg.save();
+                
+                if (msg.webhookUrl) {
+                    try {
+                        await fetch(msg.webhookUrl, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                messageId: msg._id, phone: msg.phone, type: msg.type,
+                                status: msg.status, errorMessage: msg.errorMessage
+                            })
+                        });
+                    } catch (e) { console.error("Webhook Fail", e.message); }
+                }
+                continue; 
+            }
+
+            msg.status = 'Processing';
             await msg.save();
-            
+
+            let smsResult = { sent: false, error: null };
+            let waResult = { sent: false, error: null };
+            let requiresCooldown = false;
+
+            // 1. Send via WhatsApp
+            if (msg.type === 'whatsapp' || msg.type === 'both') {
+                const sock = waSockets.get(user._id.toString());
+                if (sock && user.waStatus === 'Connected') {
+                    try {
+                        let formattedPhone = msg.phone.replace(/[^0-9]/g, '');
+                        if (!formattedPhone.endsWith('@s.whatsapp.net')) formattedPhone += '@s.whatsapp.net';
+                        
+                        // ---> CHANGED: WHATSAPP ANTI-BAN RANDOM DELAY
+                        // WhatsApp message bhejne se pehle 2 se 5 second ka gap (Human Behavior)
+                        const randomDelay = Math.floor(Math.random() * (5000 - 2000 + 1)) + 2000;
+                        await new Promise(resolve => setTimeout(resolve, randomDelay));
+
+                        // --- NEW CHANGES: Media Sending Logic ---
+                        if (msg.mediaUrls && msg.mediaUrls.length > 0) {
+                            // Send the first image with the text message as a caption
+                            await sock.sendMessage(formattedPhone, { 
+                                image: { url: msg.mediaUrls[0] }, 
+                                caption: msg.content 
+                            });
+
+                            // If there are more images, send them without a caption
+                            for (let i = 1; i < msg.mediaUrls.length; i++) {
+                                // Add a small 1.5 second delay between multiple photos to avoid WhatsApp treating it as spam
+                                await new Promise(resolve => setTimeout(resolve, 1500));
+                                await sock.sendMessage(formattedPhone, { 
+                                    image: { url: msg.mediaUrls[i] } 
+                                });
+                            }
+                        } else {
+                            // Regular text message if no media URLs exist
+                            await sock.sendMessage(formattedPhone, { text: msg.content });
+                        }
+                        // --- END NEW CHANGES ---
+
+                        waResult.sent = true;
+                    } catch (err) { waResult.error = err.message; }
+                } else { waResult.error = 'WhatsApp not connected'; }
+            }
+
+            // 2. Send via SMS (Android)
+            if (msg.type === 'sms' || msg.type === 'both') {
+                const deviceId = user.deviceId;
+                const socketId = deviceSocketMap.get(deviceId);
+                const cooldown = deviceCooldowns.get(deviceId) || 0;
+
+                if (socketId) {
+                    if (Date.now() < cooldown) {
+                        msg.status = 'Pending'; await msg.save(); continue;
+                    }
+                    requiresCooldown = true;
+                    const targetSocket = io.sockets.sockets.get(socketId);
+                    
+                    try {
+                        const response = await new Promise((resolve, reject) => {
+                            const timeout = setTimeout(() => reject(new Error('Timeout')), 15000);
+                            targetSocket.emit('send_sms_command', { phone: msg.phone, msg: msg.content, id: msg._id }, (res) => {
+                                clearTimeout(timeout); resolve(res);
+                            });
+                        });
+                        if (response && response.success) smsResult.sent = true;
+                        else smsResult.error = response ? response.error : "Failed";
+                    } catch (err) { smsResult.error = err.message; }
+                } else { smsResult.error = 'Device Offline'; }
+            }
+
+            if (requiresCooldown) deviceCooldowns.set(user.deviceId, Date.now() + 500);
+
+            // 3. Final Status Update
+            let finalStatus = 'Failed';
+            let errorMessages = [];
+
+            if (msg.type === 'whatsapp') {
+                finalStatus = waResult.sent ? 'Sent' : 'Failed';
+                if (waResult.error) errorMessages.push(`WA: ${waResult.error}`);
+            } else if (msg.type === 'sms') {
+                finalStatus = smsResult.sent ? 'Sent' : 'Failed';
+                if (smsResult.error) errorMessages.push(`SMS: ${smsResult.error}`);
+            } else if (msg.type === 'both') {
+                if (smsResult.sent && waResult.sent) finalStatus = 'Sent';
+                else if (smsResult.sent || waResult.sent) finalStatus = 'Partial';
+                else finalStatus = 'Failed';
+                if (smsResult.error) errorMessages.push(`SMS: ${smsResult.error}`);
+                if (waResult.error) errorMessages.push(`WA: ${waResult.error}`);
+            }
+
+            msg.status = finalStatus;
+            if (errorMessages.length > 0) msg.errorMessage = errorMessages.join(' | ');
+            await msg.save();
+
+            // 4. Webhook Trigger
             if (msg.webhookUrl) {
                 try {
                     await fetch(msg.webhookUrl, {
@@ -461,119 +580,11 @@ async function processQueue() {
                     });
                 } catch (e) { console.error("Webhook Fail", e.message); }
             }
-            continue; 
         }
-
-        msg.status = 'Processing';
-        await msg.save();
-
-        let smsResult = { sent: false, error: null };
-        let waResult = { sent: false, error: null };
-        let requiresCooldown = false;
-
-        // 1. Send via WhatsApp
-        if (msg.type === 'whatsapp' || msg.type === 'both') {
-            const sock = waSockets.get(user._id.toString());
-            if (sock && user.waStatus === 'Connected') {
-                try {
-                    let formattedPhone = msg.phone.replace(/[^0-9]/g, '');
-                    if (!formattedPhone.endsWith('@s.whatsapp.net')) formattedPhone += '@s.whatsapp.net';
-                    
-                    // ---> CHANGED: WHATSAPP ANTI-BAN RANDOM DELAY
-                    // WhatsApp message bhejne se pehle 2 se 5 second ka gap (Human Behavior)
-                    const randomDelay = Math.floor(Math.random() * (5000 - 2000 + 1)) + 2000;
-                    await new Promise(resolve => setTimeout(resolve, randomDelay));
-
-                    // --- NEW CHANGES: Media Sending Logic ---
-                    if (msg.mediaUrls && msg.mediaUrls.length > 0) {
-                        // Send the first image with the text message as a caption
-                        await sock.sendMessage(formattedPhone, { 
-                            image: { url: msg.mediaUrls[0] }, 
-                            caption: msg.content 
-                        });
-
-                        // If there are more images, send them without a caption
-                        for (let i = 1; i < msg.mediaUrls.length; i++) {
-                            // Add a small 1.5 second delay between multiple photos to avoid WhatsApp treating it as spam
-                            await new Promise(resolve => setTimeout(resolve, 1500));
-                            await sock.sendMessage(formattedPhone, { 
-                                image: { url: msg.mediaUrls[i] } 
-                            });
-                        }
-                    } else {
-                        // Regular text message if no media URLs exist
-                        await sock.sendMessage(formattedPhone, { text: msg.content });
-                    }
-                    // --- END NEW CHANGES ---
-
-                    waResult.sent = true;
-                } catch (err) { waResult.error = err.message; }
-            } else { waResult.error = 'WhatsApp not connected'; }
-        }
-
-        // 2. Send via SMS (Android)
-        if (msg.type === 'sms' || msg.type === 'both') {
-            const deviceId = user.deviceId;
-            const socketId = deviceSocketMap.get(deviceId);
-            const cooldown = deviceCooldowns.get(deviceId) || 0;
-
-            if (socketId) {
-                if (Date.now() < cooldown) {
-                    msg.status = 'Pending'; await msg.save(); continue;
-                }
-                requiresCooldown = true;
-                const targetSocket = io.sockets.sockets.get(socketId);
-                
-                try {
-                    const response = await new Promise((resolve, reject) => {
-                        const timeout = setTimeout(() => reject(new Error('Timeout')), 15000);
-                        targetSocket.emit('send_sms_command', { phone: msg.phone, msg: msg.content, id: msg._id }, (res) => {
-                            clearTimeout(timeout); resolve(res);
-                        });
-                    });
-                    if (response && response.success) smsResult.sent = true;
-                    else smsResult.error = response ? response.error : "Failed";
-                } catch (err) { smsResult.error = err.message; }
-            } else { smsResult.error = 'Device Offline'; }
-        }
-
-        if (requiresCooldown) deviceCooldowns.set(user.deviceId, Date.now() + 500);
-
-        // 3. Final Status Update
-        let finalStatus = 'Failed';
-        let errorMessages = [];
-
-        if (msg.type === 'whatsapp') {
-            finalStatus = waResult.sent ? 'Sent' : 'Failed';
-            if (waResult.error) errorMessages.push(`WA: ${waResult.error}`);
-        } else if (msg.type === 'sms') {
-            finalStatus = smsResult.sent ? 'Sent' : 'Failed';
-            if (smsResult.error) errorMessages.push(`SMS: ${smsResult.error}`);
-        } else if (msg.type === 'both') {
-            if (smsResult.sent && waResult.sent) finalStatus = 'Sent';
-            else if (smsResult.sent || waResult.sent) finalStatus = 'Partial';
-            else finalStatus = 'Failed';
-            if (smsResult.error) errorMessages.push(`SMS: ${smsResult.error}`);
-            if (waResult.error) errorMessages.push(`WA: ${waResult.error}`);
-        }
-
-        msg.status = finalStatus;
-        if (errorMessages.length > 0) msg.errorMessage = errorMessages.join(' | ');
-        await msg.save();
-
-        // 4. Webhook Trigger
-        if (msg.webhookUrl) {
-            try {
-                await fetch(msg.webhookUrl, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        messageId: msg._id, phone: msg.phone, type: msg.type,
-                        status: msg.status, errorMessage: msg.errorMessage
-                    })
-                });
-            } catch (e) { console.error("Webhook Fail", e.message); }
-        }
+    } catch (error) {
+        console.error("Queue Processor Error:", error);
+    } finally {
+        isProcessingQueue = false;
     }
 }
 
